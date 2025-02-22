@@ -4,10 +4,10 @@ use anchor_spl::token_2022::{
     Token2022,
 };
 
-declare_id!("oxVfwRSnZPH5Z81NgL45BY6jJ5ywi4yVbcbnjQdxm2z");
+declare_id!("41BBJyFbgxQ2kZFz7w5VzBwYAQ4L329zVVJHRXofeNjF");
 
 #[program]
-pub mod create_spl_2022_mint {
+pub mod token_manager {
     use super::*;
 
     /// Creates a new SPL Token 2022 mint.
