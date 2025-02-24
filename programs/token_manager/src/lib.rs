@@ -1,36 +1,99 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token_interface::{Mint, TokenInterface};
 
-
 declare_id!("DFUYFchyBFtTjwGUKwdd6KsozCkT1Qkpx18KJAk5Esv5");
 
 #[program]
 pub mod token_manager {
     use super::*;
 
-    // Initializes the TokenManager state account.
-    // This account will store all created token mints along with their ISIN codes.
+    /// Initializes the TokenManager state account.
+    /// This account will store all created token mints along with their ISIN codes.
     pub fn initialize_token_manager(ctx: Context<InitializeTokenManager>) -> Result<()> {
-        let state = &mut ctx.accounts.token_manager;
-        state.tokens = Vec::new();
+        ctx.accounts.token_manager.tokens = Vec::new();
+        ctx.accounts.token_manager.current_token_index = 0;
         Ok(())
     }
 
-    // Creates a new share (i.e. deploys a new token mint) with the specified number of decimals
-    // and the provided ISIN code. The mint authority is set to the TokenManager PDA.
+    /// Creates a new token share by deploying a new token mint with the specified number of decimals and ISIN code.
+    ///
+    /// # Arguments
+    ///
+    /// * `_decimals` - The number of decimals for the token mint.
+    /// * `isin` - The unique ISIN code identifier for the token.
     pub fn create_new_share(
         ctx: Context<CreateNewShare>,
         _decimals: u8,
         isin: String,
     ) -> Result<()> {
-        // Record the new token’s mint address along with its ISIN.
         let token_share = TokenShare {
             mint: ctx.accounts.mint.key(),
             isin,
         };
         ctx.accounts.token_manager.tokens.push(token_share);
-
+        ctx.accounts.token_manager.current_token_index += 1;
         Ok(())
+    }
+
+    /// Adds a wallet authorization to the whitelist for a token identified by its ISIN.
+    ///
+    /// # Arguments
+    ///
+    /// * `wallet` - The wallet public key to be added to the whitelist.
+    /// * `isin` - The unique ISIN code used to find the token.
+    pub fn add_to_whitelist(
+        ctx: Context<Whitelist>,
+        wallet: Pubkey,
+        isin: String,
+    ) -> Result<()> {
+        if let Some(token) = &ctx
+            .accounts
+            .token_manager
+            .tokens
+            .iter()
+            .find(|token| token.isin == isin)
+        {
+            let authorization = Authorization {
+                mint: token.mint,
+                authority: wallet,
+            };
+            ctx.accounts.token_manager.whitelist.push(authorization);
+            return Ok(());
+        }
+        return Err(error!(TokenManagerError::TokenNotFound));
+    }
+
+    /// Removes a wallet authorization from the whitelist for a token identified by its ISIN.
+    ///
+    /// # Arguments
+    ///
+    /// * `wallet` - The wallet public key to be removed from the whitelist.
+    /// * `isin` - The unique ISIN code used to find the token.
+    pub fn remove_from_whitelist(
+        ctx: Context<Whitelist>,
+        wallet: Pubkey,
+        isin: String,
+    ) -> Result<()> {
+        if let Some(token) = &ctx
+            .accounts
+            .token_manager
+            .tokens
+            .iter()
+            .find(|token| token.isin == isin)
+        {
+            if let Some(index) = &ctx
+                .accounts
+                .token_manager
+                .whitelist
+                .iter()
+                .position(|auth| auth.mint == token.mint && auth.authority == wallet)
+            {
+                ctx.accounts.token_manager.whitelist.remove(*index);
+                return Ok(());
+            }
+            return Err(error!(TokenManagerError::WalletNotFound));
+        }
+        Err(error!(TokenManagerError::TokenNotFound))
     }
 }
 
@@ -63,7 +126,7 @@ pub struct CreateNewShare<'info> {
     #[account(
         init,
         payer = signer,
-        seeds = [b"token", token_manager.key().as_ref(), &token_manager.tokens.len().to_le_bytes()],
+        seeds = [b"token", token_manager.key().as_ref(), &token_manager.current_token_index.to_le_bytes()],
         bump,
         mint::decimals = _decimals,
         mint::authority = token_manager.key(),
@@ -76,14 +139,44 @@ pub struct CreateNewShare<'info> {
 #[account]
 #[derive(InitSpace)]
 pub struct TokenManager {
-    #[max_len(100)]
+    pub current_token_index: u64,
+    #[max_len(10)]
     pub tokens: Vec<TokenShare>,
+    #[max_len(10)]
+    pub whitelist: Vec<Authorization>,
 }
 
 #[account]
 #[derive(InitSpace)]
 pub struct TokenShare {
-    pub mint: Pubkey,
     #[max_len(12)]
     pub isin: String,
+    pub mint: Pubkey,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct Authorization {
+    pub mint: Pubkey,
+    pub authority: Pubkey,
+}
+
+#[derive(Accounts)]
+pub struct Whitelist<'info> {
+    #[account(mut)]
+    pub signer: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [b"token-manager", signer.key().as_ref()],
+        bump,
+    )]
+    pub token_manager: Account<'info, TokenManager>,
+}
+
+#[error_code]
+pub enum TokenManagerError {
+    #[msg("Token not found")]
+    TokenNotFound,
+    #[msg("Wallet not found")]
+    WalletNotFound,
 }
