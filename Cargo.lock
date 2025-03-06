@@ -2337,6 +2337,11 @@ version = "0.1.0"
 dependencies = [
  "anchor-lang",
  "anchor-spl",
+ "spl-pod",
+ "spl-tlv-account-resolution",
+ "spl-token-2022",
+ "spl-token-metadata-interface",
+ "spl-transfer-hook-interface",
 ]
 
 [[package]]

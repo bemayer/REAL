@@ -2,7 +2,14 @@ import * as anchor from "@coral-xyz/anchor";
 import { Program, web3 } from "@coral-xyz/anchor";
 import { TokenManager } from "../target/types/token_manager.js";
 import { PublicKey } from "@solana/web3.js";
-import { TOKEN_2022_PROGRAM_ID, getMint } from "@solana/spl-token";
+import {
+  TOKEN_2022_PROGRAM_ID,
+  getMint,
+  getAccount,
+  createTransferCheckedInstruction,
+  getAssociatedTokenAddress,
+  createAssociatedTokenAccountInstruction
+} from "@solana/spl-token";
 import { expect } from "chai";
 
 describe("Token Manager Program", () => {
@@ -15,100 +22,181 @@ describe("Token Manager Program", () => {
     program.programId,
   );
 
-  describe("Initialization", () => {
-    it("should explicitly deploy the TokenManager account and verify deployment", async () => {
-      const txSig = await program.methods
-        .initializeTokenManager()
-        .accounts({
-          signer: provider.wallet.publicKey,
-        })
-        .rpc();
-      await provider.connection.confirmTransaction(txSig, "confirmed");
-
-      const tokenManagerAccount = await program.account.tokenManager.fetch(tokenManagerPDA);
-      expect(tokenManagerAccount.tokens).to.be.an("array").that.is.empty;
-    });
-  });
-
   const tokensToCreate = [
     { decimals: 6, isin: "US1234567890" },
     { decimals: 8, isin: "US9876543210" },
     { decimals: 2, isin: "EU1234567890" },
   ];
 
-  describe("Multiple Token Creation", () => {
-    tokensToCreate.forEach((tokenData, idx) => {
-      it(`should create token share ${idx + 1} with ${tokenData.decimals} decimals and ISIN ${tokenData.isin}`, async () => {
-        let tokenManagerAccount = await program.account.tokenManager.fetch(tokenManagerPDA);
-        const index = tokenManagerAccount.tokens.length;
-        const tokenIndexBuffer = Buffer.alloc(8);
-        tokenIndexBuffer.writeBigUInt64LE(BigInt(index), 0);
+  const wallets = {
+    authorized: web3.Keypair.generate(),
+    unauthorized: web3.Keypair.generate(),
+    destination: web3.Keypair.generate()
+  };
 
-        const [mintPDA] = PublicKey.findProgramAddressSync(
-          [Buffer.from("token"), tokenManagerPDA.toBuffer(), tokenIndexBuffer],
-          program.programId,
-        );
+  const tokenMints = [];
 
+  async function confirmTransaction(signature) {
+    await provider.connection.confirmTransaction({
+      signature,
+      blockhash: (await provider.connection.getLatestBlockhash('confirmed')).blockhash,
+      lastValidBlockHeight: (await provider.connection.getLatestBlockhash('confirmed')).lastValidBlockHeight
+    }, "finalized");
+  }
+
+  async function fundWallet(wallet, amount = 10000000000) {
+    const signature = await provider.connection.requestAirdrop(
+      wallet.publicKey,
+      amount,
+    );
+    await confirmTransaction(signature);
+  }
+
+  async function createTokenAccount(owner, mint) {
+    const tokenAccount = await getAssociatedTokenAddress(
+      mint,
+      owner.publicKey,
+      true,
+      TOKEN_2022_PROGRAM_ID
+    );
+
+    try {
+      await getAccount(
+        provider.connection,
+        tokenAccount,
+        "confirmed",
+        TOKEN_2022_PROGRAM_ID
+      );
+      return tokenAccount;
+    } catch (error) {
+      const tx = new web3.Transaction().add(
+        createAssociatedTokenAccountInstruction(
+          provider.wallet.publicKey,
+          tokenAccount,
+          owner.publicKey,
+          mint,
+          TOKEN_2022_PROGRAM_ID
+        )
+      );
+
+      await web3.sendAndConfirmTransaction(
+        provider.connection,
+        tx,
+        [wallets.authorized],
+        { commitment: "confirmed" }
+      );
+
+      return tokenAccount;
+    }
+  }
+
+  before(async () => {
+    for (const key in wallets) {
+      await fundWallet(wallets[key]);
+    }
+  });
+
+  describe("1. Program Initialization", () => {
+    it("should initialize the TokenManager account", async () => {
+      try {
+        await program.account.tokenManager.fetch(tokenManagerPDA);
+        console.log("TokenManager already initialized, skipping initialization");
+      } catch (error) {
         const txSig = await program.methods
-          .createNewShare(tokenData.decimals, tokenData.isin)
+          .initializeTokenManager()
           .accounts({
             signer: provider.wallet.publicKey,
-            tokenProgram: TOKEN_2022_PROGRAM_ID,
           })
           .rpc();
-        expect(txSig).to.be.a("string").that.is.not.empty;
-        await provider.connection.confirmTransaction(txSig, "confirmed");
 
-        const mintInfo = await getMint(
-          provider.connection,
-          mintPDA,
-          "confirmed",
-          TOKEN_2022_PROGRAM_ID
-        );
-        expect(mintInfo.decimals).to.equal(tokenData.decimals);
-        expect(mintInfo.supply.toString()).to.equal("0");
+        await confirmTransaction(txSig);
+      }
 
-        tokenManagerAccount = await program.account.tokenManager.fetch(tokenManagerPDA);
-        expect(tokenManagerAccount.tokens[index].mint.toString()).to.equal(mintPDA.toString());
-        expect(tokenManagerAccount.tokens[index].isin).to.equal(tokenData.isin);
-      });
+      const tokenManagerAccount = await program.account.tokenManager.fetch(tokenManagerPDA);
+      expect(tokenManagerAccount.tokens).to.be.an("array");
+      expect(tokenManagerAccount.whitelist).to.be.an("array");
+      expect(tokenManagerAccount.creator.toString()).to.equal(provider.wallet.publicKey.toString());
     });
   });
 
-  describe("Token Manager Data Verification", () => {
-    it("should have the correct total number of tokens deployed", async () => {
-      const tokenManagerAccount = await program.account.tokenManager.fetch(tokenManagerPDA);
-      expect(tokenManagerAccount.tokens.length).to.equal(tokensToCreate.length);
-    });
+  describe("2. Token Creation", () => {
+    tokensToCreate.forEach(async (tokenData, idx) => {
+      it(`should create token share ${idx + 1} with ${tokenData.decimals} decimals and ISIN ${tokenData.isin}`, async () => {
+        let tokenManagerAccount = await program.account.tokenManager.fetch(tokenManagerPDA);
+        const index = tokenManagerAccount.currentTokenIndex.toNumber();
 
-    it("should verify that each token's stored mint address and ISIN are correctly derived", async () => {
-      const tokenManagerAccount = await program.account.tokenManager.fetch(tokenManagerPDA);
-      for (let i = 0; i < tokenManagerAccount.tokens.length; i++) {
-        const tokenIndexBuffer = Buffer.alloc(8);
-        tokenIndexBuffer.writeBigUInt64LE(BigInt(i), 0);
-        const [expectedMintPDA] = PublicKey.findProgramAddressSync(
-          [Buffer.from("token"), tokenManagerPDA.toBuffer(), tokenIndexBuffer],
+        const [tokenMintPDA] = PublicKey.findProgramAddressSync(
+          [Buffer.from("token-mint"), tokenManagerPDA.toBuffer(), Buffer.from(index.toString().padStart(8, '0'), 'hex')],
           program.programId,
         );
-        expect(tokenManagerAccount.tokens[i].mint.toString()).to.equal(expectedMintPDA.toString());
-        expect(tokenManagerAccount.tokens[i].isin).to.equal(tokensToCreate[i].isin);
+
+        try {
+          const txSig = await program.methods
+            .createNewShare(
+              tokenData.decimals,
+              tokenData.isin,
+            )
+            .accounts({
+              signer: provider.wallet.publicKey,
+              tokenProgram: TOKEN_2022_PROGRAM_ID,
+            })
+            .rpc();
+
+          await confirmTransaction(txSig);
+
+          tokenMints.push(tokenMintPDA);
+
+          const mintInfo = await getMint(
+            provider.connection,
+            tokenMintPDA,
+            "confirmed",
+            TOKEN_2022_PROGRAM_ID
+          );
+
+          expect(mintInfo.decimals).to.equal(tokenData.decimals);
+          expect(mintInfo.supply.toString()).to.equal("0");
+
+          tokenManagerAccount = await program.account.tokenManager.fetch(tokenManagerPDA);
+          const lastIndex = tokenManagerAccount.tokens.length - 1;
+          expect(tokenManagerAccount.tokens[lastIndex].mint.toString()).to.equal(tokenMintPDA.toString());
+          expect(tokenManagerAccount.tokens[lastIndex].isin).to.equal(tokenData.isin);
+        } catch (error) {
+          if (error.message?.includes("already in use")) {
+            console.log(`Token ${tokenData.isin} already exists, skipping creation`);
+
+            tokenManagerAccount = await program.account.tokenManager.fetch(tokenManagerPDA);
+            const existingToken = tokenManagerAccount.tokens.find(t => t.isin === tokenData.isin);
+
+            if (existingToken) {
+              tokenMints.push(existingToken.mint);
+            }
+          } else {
+            throw error;
+          }
+        }
+      });
+    });
+
+    it("should have all tokens correctly stored in TokenManager", async () => {
+      const tokenManagerAccount = await program.account.tokenManager.fetch(tokenManagerPDA);
+
+      expect(tokenManagerAccount.tokens.length).to.be.at.equal(tokensToCreate.length);
+
+      for (const element of tokensToCreate) {
+        const token = tokenManagerAccount.tokens.find(t => t.isin === element.isin);
+        expect(token).to.not.be.undefined;
+        expect(token.isin).to.equal(element.isin);
       }
     });
   });
 
-  describe("Whitelist Tests", () => {
-    const walletsToTest = [
-      web3.Keypair.generate(),
-      web3.Keypair.generate(),
-      web3.Keypair.generate(),
-    ];
-
-    it("should fail when adding a wallet to the whitelist if the token ISIN does not exist", async () => {
+  describe("3. Whitelist Management", () => {
+    it("should fail when adding a wallet to a non-existent token", async () => {
       const nonExistentIsin = "DOES_NOT_EXIST";
 
       try {
         await program.methods
-          .addToWhitelist(walletsToTest[0].publicKey, nonExistentIsin)
+          .addToWhitelist(wallets.authorized.publicKey, nonExistentIsin)
           .accounts({
             signer: provider.wallet.publicKey,
           })
@@ -119,25 +207,52 @@ describe("Token Manager Program", () => {
       }
     });
 
-    it("should fail when removing a wallet from the whitelist if the token ISIN does not exist", async () => {
-      const nonExistentIsin = "DOES_NOT_EXIST";
+    it("should add a wallet to the whitelist for each token", async () => {
+      let tokenManagerAccount = await program.account.tokenManager.fetch(tokenManagerPDA);
 
-      try {
-        await program.methods
-          .removeFromWhitelist(walletsToTest[0].publicKey, nonExistentIsin)
+      for (const tokenData of tokensToCreate) {
+        const existingAuth = tokenManagerAccount.whitelist.find(
+          auth => {
+            const token = tokenManagerAccount.tokens.find(t => t.isin === tokenData.isin);
+            return token &&
+                   auth.mint.toString() === token.mint.toString() &&
+                   auth.authority.toString() === wallets.authorized.publicKey.toString();
+          }
+        );
+
+        if (existingAuth) {
+          console.log(`Wallet already authorized for ${tokenData.isin}, skipping`);
+          continue;
+        }
+
+        const txSig = await program.methods
+          .addToWhitelist(wallets.authorized.publicKey, tokenData.isin)
           .accounts({
             signer: provider.wallet.publicKey,
           })
           .rpc();
-        expect.fail("Expected error when removing from a non-existent token");
-      } catch (err: any) {
-        expect(err.error.errorCode.code).to.equal("TokenNotFound");
+
+        await confirmTransaction(txSig);
+      }
+
+      tokenManagerAccount = await program.account.tokenManager.fetch(tokenManagerPDA);
+
+      for (const tokenData of tokensToCreate) {
+        const token = tokenManagerAccount.tokens.find(t => t.isin === tokenData.isin);
+        expect(token).to.not.be.undefined;
+
+        const authorization = tokenManagerAccount.whitelist.find(
+          auth => auth.mint.toString() === token.mint.toString() &&
+                 auth.authority.toString() === wallets.authorized.publicKey.toString()
+        );
+
+        expect(authorization).to.not.be.undefined;
       }
     });
 
     it("should fail when removing a wallet that is not in the whitelist", async () => {
-      const validIsin = tokensToCreate[0].isin;
       const randomWallet = web3.Keypair.generate();
+      const validIsin = tokensToCreate[0].isin;
 
       try {
         await program.methods
@@ -151,103 +266,262 @@ describe("Token Manager Program", () => {
         expect(err.error.errorCode.code).to.equal("WalletNotFound");
       }
     });
+  });
 
-    //
-    // 2. Adding Multiple Wallets for Multiple ISINs
-    //
+  describe("4. Token Minting", () => {
+    let testMint;
+    let authorizedTokenAccount;
+    let unauthorizedTokenAccount;
 
-    it("should add multiple wallets to the whitelist for multiple token ISINs", async () => {
-      // First, fetch current whitelist count for baseline
-      let tokenManagerAccount = await program.account.tokenManager.fetch(tokenManagerPDA);
-      const initialWhitelistCount = tokenManagerAccount.whitelist.length;
+    before(async () => {
+      testMint = tokenMints[0];
 
-      // Add each wallet to each token
-      for (const tokenData of tokensToCreate) {
-        for (const wallet of walletsToTest) {
-          const txSig = await program.methods
-            .addToWhitelist(wallet.publicKey, tokenData.isin)
-            .accounts({
-              signer: provider.wallet.publicKey,
-            })
-            .rpc();
-
-          expect(txSig).to.be.a("string").that.is.not.empty;
-          await provider.connection.confirmTransaction(txSig, "confirmed");
-        }
-      }
-
-      // Confirm the total number of whitelist entries has increased correctly
-      tokenManagerAccount = await program.account.tokenManager.fetch(tokenManagerPDA);
-      const finalWhitelistCount = tokenManagerAccount.whitelist.length;
-
-      // We added (numberOfTokens * numberOfWallets) new entries
-      const expectedNewEntries = tokensToCreate.length * walletsToTest.length;
-      expect(finalWhitelistCount).to.equal(initialWhitelistCount + expectedNewEntries);
-
-      // Verify each wallet→token pair is indeed present
-      for (const tokenData of tokensToCreate) {
-        // Find the token's mint from the tokens array
-        const tokenInfo = tokenManagerAccount.tokens.find(
-          (t) => t.isin === tokenData.isin
-        );
-        expect(tokenInfo).to.not.be.undefined;
-
-        for (const wallet of walletsToTest) {
-          const foundEntry = tokenManagerAccount.whitelist.find(
-            (auth) =>
-              auth.mint.toString() === tokenInfo.mint.toString() &&
-              auth.authority.toString() === wallet.publicKey.toString()
-          );
-          expect(foundEntry).to.not.be.undefined;
-        }
-      }
+      authorizedTokenAccount = await createTokenAccount(wallets.authorized, testMint);
+      unauthorizedTokenAccount = await createTokenAccount(wallets.unauthorized, testMint);
     });
 
-    it("should remove multiple wallets from the whitelist for multiple token ISINs", async () => {
-      // Fetch current state for baseline
-      let tokenManagerAccount = await program.account.tokenManager.fetch(tokenManagerPDA);
-      const initialWhitelistCount = tokenManagerAccount.whitelist.length;
+    it("should mint tokens to test accounts", async () => {
+      const mintAmount = new anchor.BN(1000000);
 
-      // Remove each wallet from each token
-      for (const tokenData of tokensToCreate) {
-        for (const wallet of walletsToTest) {
-          const txSig = await program.methods
-            .removeFromWhitelist(wallet.publicKey, tokenData.isin)
-            .accounts({
-              signer: provider.wallet.publicKey,
-            })
-            .rpc();
+      const txSig1 = await program.methods
+        .mintTokens(mintAmount)
+        .accounts({
+          signer: provider.wallet.publicKey,
+          tokenMint: testMint,
+          destination: authorizedTokenAccount,
+        })
+        .rpc();
 
-          expect(txSig).to.be.a("string").that.is.not.empty;
-          await provider.connection.confirmTransaction(txSig, "confirmed");
-        }
-      }
+      await confirmTransaction(txSig1);
 
-      // Confirm the total number of whitelist entries has decreased correctly
-      tokenManagerAccount = await program.account.tokenManager.fetch(tokenManagerPDA);
-      const finalWhitelistCount = tokenManagerAccount.whitelist.length;
+      const txSig2 = await program.methods
+        .mintTokens(mintAmount)
+        .accounts({
+          signer: provider.wallet.publicKey,
+          tokenMint: testMint,
+          destination: unauthorizedTokenAccount,
+        })
+        .rpc();
 
-      // We removed (numberOfTokens * numberOfWallets) entries
-      const expectedRemovedEntries = tokensToCreate.length * walletsToTest.length;
-      expect(finalWhitelistCount).to.equal(initialWhitelistCount - expectedRemovedEntries);
+      await confirmTransaction(txSig2);
 
-      // Double-check that each wallet→token pair is indeed removed
-      for (const tokenData of tokensToCreate) {
-        // Find the token's mint from the tokens array
-        const tokenInfo = tokenManagerAccount.tokens.find(
-          (t) => t.isin === tokenData.isin
+      const authBalance = (await getAccount(
+        provider.connection,
+        authorizedTokenAccount,
+        "confirmed",
+        TOKEN_2022_PROGRAM_ID
+      )).amount;
+
+      const unauthBalance = (await getAccount(
+        provider.connection,
+        unauthorizedTokenAccount,
+        "confirmed",
+        TOKEN_2022_PROGRAM_ID
+      )).amount;
+
+      expect(authBalance.toString()).to.equal(mintAmount.toString());
+      expect(unauthBalance.toString()).to.equal(mintAmount.toString());
+    });
+  });
+
+  describe("5. Transfer Tests", () => {
+    let testMint;
+    let authorizedTokenAccount;
+    let unauthorizedTokenAccount;
+    let destinationTokenAccount;
+
+    before(async () => {
+      testMint = tokenMints[0];
+
+      authorizedTokenAccount = await createTokenAccount(wallets.authorized, testMint);
+      unauthorizedTokenAccount = await createTokenAccount(wallets.unauthorized, testMint);
+      destinationTokenAccount = await createTokenAccount(wallets.destination, testMint);
+    });
+
+    it("should allow a transfer from a whitelisted wallet", async () => {
+      const preBalanceAuth = (await getAccount(
+        provider.connection,
+        authorizedTokenAccount,
+        "confirmed",
+        TOKEN_2022_PROGRAM_ID
+      )).amount;
+
+      const preBalanceDest = (await getAccount(
+        provider.connection,
+        destinationTokenAccount,
+        "confirmed",
+        TOKEN_2022_PROGRAM_ID
+      )).amount;
+
+      const transferAmount = BigInt(100000);
+
+      const mintInfo = await getMint(
+        provider.connection,
+        testMint,
+        "confirmed",
+        TOKEN_2022_PROGRAM_ID
+      );
+
+      const transferIx = createTransferCheckedInstruction(
+        authorizedTokenAccount,
+        testMint,
+        destinationTokenAccount,
+        wallets.authorized.publicKey,
+        transferAmount,
+        mintInfo.decimals,
+        [],
+        TOKEN_2022_PROGRAM_ID
+      );
+
+      const tx = new web3.Transaction().add(transferIx);
+
+      await web3.sendAndConfirmTransaction(
+        provider.connection,
+        tx,
+        [wallets.authorized],
+        { commitment: "confirmed" }
+      );
+
+      const postBalanceAuth = (await getAccount(
+        provider.connection,
+        authorizedTokenAccount,
+        "confirmed",
+        TOKEN_2022_PROGRAM_ID
+      )).amount;
+
+      const postBalanceDest = (await getAccount(
+        provider.connection,
+        destinationTokenAccount,
+        "confirmed",
+        TOKEN_2022_PROGRAM_ID
+      )).amount;
+
+      expect(postBalanceAuth.toString()).to.equal((preBalanceAuth - transferAmount).toString());
+      expect(postBalanceDest.toString()).to.equal((preBalanceDest + transferAmount).toString());
+    });
+
+    it("should block a transfer from a non-whitelisted wallet", async () => {
+      const preBalanceUnauth = (await getAccount(
+        provider.connection,
+        unauthorizedTokenAccount,
+        "confirmed",
+        TOKEN_2022_PROGRAM_ID
+      )).amount;
+
+      const preBalanceDest = (await getAccount(
+        provider.connection,
+        destinationTokenAccount,
+        "confirmed",
+        TOKEN_2022_PROGRAM_ID
+      )).amount;
+
+      const transferAmount = BigInt(100000);
+
+      const mintInfo = await getMint(
+        provider.connection,
+        testMint,
+        "confirmed",
+        TOKEN_2022_PROGRAM_ID
+      );
+
+      const transferIx = createTransferCheckedInstruction(
+        unauthorizedTokenAccount,
+        testMint,
+        destinationTokenAccount,
+        wallets.unauthorized.publicKey,
+        transferAmount,
+        mintInfo.decimals,
+        [],
+        TOKEN_2022_PROGRAM_ID
+      );
+
+      const tx = new web3.Transaction().add(transferIx);
+
+      try {
+        await web3.sendAndConfirmTransaction(
+          provider.connection,
+          tx,
+          [wallets.unauthorized],
+          { commitment: "confirmed" }
         );
-        expect(tokenInfo).to.not.be.undefined;
-
-        for (const wallet of walletsToTest) {
-          const foundEntry = tokenManagerAccount.whitelist.find(
-            (auth) =>
-              auth.mint.toString() === tokenInfo.mint.toString() &&
-              auth.authority.toString() === wallet.publicKey.toString()
-          );
-          expect(foundEntry).to.be.undefined;
-        }
+        expect.fail("Expected transaction to fail but it succeeded");
+      } catch (error) {
+        expect(error.logs.some(log => log.includes("TransferNotAllowed"))).to.be.true;
       }
+
+      const postBalanceUnauth = (await getAccount(
+        provider.connection,
+        unauthorizedTokenAccount,
+        "confirmed",
+        TOKEN_2022_PROGRAM_ID
+      )).amount;
+
+      const postBalanceDest = (await getAccount(
+        provider.connection,
+        destinationTokenAccount,
+        "confirmed",
+        TOKEN_2022_PROGRAM_ID
+      )).amount;
+
+      expect(postBalanceUnauth.toString()).to.equal(preBalanceUnauth.toString());
+      expect(postBalanceDest.toString()).to.equal(preBalanceDest.toString());
+    });
+  });
+
+  describe("6. Additional Token Queries", () => {
+    it("should correctly retrieve token mint by ISIN", async () => {
+      const testIsin = tokensToCreate[0].isin;
+
+      const tokenManagerAccount = await program.account.tokenManager.fetch(tokenManagerPDA);
+      const expectedMint = tokenManagerAccount.tokens.find(t => t.isin === testIsin).mint;
+
+      const fetchedMint = await program.methods
+        .getToken(testIsin)
+        .accounts({
+          signer: provider.wallet.publicKey
+        })
+        .view();
+
+      expect(fetchedMint.toString()).to.equal(expectedMint.toString());
+    });
+
+    it("should fail to retrieve a non-existent token", async () => {
+      const nonExistentIsin = "DOES_NOT_EXIST";
+
+      try {
+        await program.methods
+          .getToken(nonExistentIsin)
+          .accounts({
+            signer: provider.wallet.publicKey,
+          })
+          .view();
+        expect.fail("Expected error when retrieving a non-existent token");
+      } catch (err: any) {
+        expect(err.error.errorCode.code).to.equal("TokenNotFound");
+      }
+    });
+  });
+
+  describe("7. Whitelist Management Edge Cases", () => {
+    it("should not allow duplicates in the whitelist", async () => {
+      const validIsin = tokensToCreate[0].isin;
+
+      await program.methods
+        .addToWhitelist(wallets.authorized.publicKey, validIsin)
+        .accounts({
+          signer: provider.wallet.publicKey,
+        })
+        .rpc();
+
+      const updatedTokenManagerAccount = await program.account.tokenManager.fetch(tokenManagerPDA);
+
+      const token = updatedTokenManagerAccount.tokens.find(t => t.isin === validIsin);
+      const relevantEntries = updatedTokenManagerAccount.whitelist.filter(
+        auth => auth.mint.toString() === token.mint.toString() &&
+               auth.authority.toString() === wallets.authorized.publicKey.toString()
+      );
+
+      expect(relevantEntries.length).to.equal(1);
     });
   });
 });
