@@ -11,6 +11,7 @@ use anchor_lang::{
 
 use anchor_spl::{
     token_2022::{mint_to, MintTo, Token2022},
+    token_2022_extensions::spl_token_metadata_interface,
     token_interface::{Mint, TokenAccount},
 };
 
@@ -67,19 +68,23 @@ pub mod token_manager {
             .ok_or(error!(TokenManagerError::IndexOverflow))?;
 
         // 1. Calculate required space for mint with all extensions and metadata
-        let space = ExtensionType::try_calculate_account_len::<spl_token_2022::state::Mint>(&[
-            ExtensionType::TransferHook,
-            ExtensionType::MetadataPointer,
-        ])
-        .expect("Failed to calculate space");
         let name = format!("Security Token {}", isin);
         let symbol = isin.clone();
         let uri = String::new();
+
+        // Calculate space with embedded metadata
+        let token_space =
+            ExtensionType::try_calculate_account_len::<spl_token_2022::state::Mint>(&[
+                ExtensionType::TransferHook,
+                ExtensionType::MetadataPointer,
+            ])
+            .expect("Failed to calculate space");
         let metadata_space = calculate_metadata_space(&name, &symbol, &uri);
+        let total_space = token_space + metadata_space;
 
         // 2. Calculate rent exemption
         let rent = Rent::get()?;
-        let lamports = rent.minimum_balance(space + metadata_space);
+        let lamports = rent.minimum_balance(total_space);
 
         // 3. Get PDA seeds from Anchor's context
         let token_mint_bump = ctx.bumps.token_mint;
@@ -93,18 +98,19 @@ pub mod token_manager {
         let token_mint_signer = &[&token_mint_seeds[..]];
 
         // 4. Create the mint account
+        let token_mint_key = &ctx.accounts.token_mint.key();
         msg!(
             "Creating token mint account {} with {} bytes",
-            ctx.accounts.token_mint.key(),
-            space + metadata_space,
+            token_mint_key,
+            total_space,
         );
 
         invoke_signed(
             &system_instruction::create_account(
                 &ctx.accounts.signer.key(),
-                &ctx.accounts.token_mint.key(),
+                token_mint_key,
                 lamports,
-                space as u64,
+                token_space as u64,
                 &ctx.accounts.token_program.key(),
             ),
             &[
@@ -123,36 +129,38 @@ pub mod token_manager {
         // 5. Initialize extensions first
         msg!("Initializing extensions");
 
-        // Initialize MetadataPointer extension
-        let metadata_pointer_ix =
-            spl_token_2022::extension::metadata_pointer::instruction::initialize(
-                &ctx.accounts.token_program.key(),
-                &ctx.accounts.token_mint.key(),
-                Some(ctx.accounts.token_mint_authority.key()),
-                Some(ctx.accounts.token_metadata.key()),
-            )?;
-
-        invoke(
-            &metadata_pointer_ix,
-            &[
-                ctx.accounts.token_mint.to_account_info(),
-                ctx.accounts.token_mint_authority.to_account_info(),
-            ],
-        )?;
-
         // Initialize TransferHook extension
+        msg!("Initializing TransferHook extension");
         let transfer_hook_ix = spl_token_2022::extension::transfer_hook::instruction::initialize(
             &ctx.accounts.token_program.key(),
-            &ctx.accounts.token_mint.key(),
-            Some(ctx.accounts.token_mint_authority.key()),
-            Some(*ctx.program_id),
+            token_mint_key,
+            Some(*token_mint_key),
+            Some(*token_mint_key),
         )?;
 
         invoke(
             &transfer_hook_ix,
             &[
                 ctx.accounts.token_mint.to_account_info(),
-                ctx.accounts.token_mint_authority.to_account_info(),
+                ctx.accounts.token_mint.to_account_info(),
+            ],
+        )?;
+
+        // Initialize MetadataPointer extension
+        msg!("Initializing MetadataPointer extension");
+        let metadata_pointer_ix =
+            spl_token_2022::extension::metadata_pointer::instruction::initialize(
+                &ctx.accounts.token_program.key(),
+                token_mint_key,
+                Some(*token_mint_key),
+                Some(*token_mint_key),
+            )?;
+
+        invoke(
+            &metadata_pointer_ix,
+            &[
+                ctx.accounts.token_mint.to_account_info(),
+                ctx.accounts.token_mint.to_account_info(),
             ],
         )?;
 
@@ -160,18 +168,15 @@ pub mod token_manager {
         msg!("Initializing mint {}", ctx.accounts.token_mint.key());
         let init_mint_ix = spl_token_2022::instruction::initialize_mint2(
             &ctx.accounts.token_program.key(),
-            &ctx.accounts.token_mint.key(),
-            &ctx.accounts.token_mint_authority.key(),
-            Some(&ctx.accounts.token_mint_authority.key()),
+            token_mint_key,
+            token_mint_key,
+            Some(token_mint_key),
             decimals,
         )?;
 
         msg!("Invoking SPL Token 2022 mint instruction");
         msg!("Token manager: {}", token_manager);
-        msg!(
-            "Token mint authority: {}",
-            ctx.accounts.token_mint_authority.key()
-        );
+        msg!("Token mint authority: {}", ctx.accounts.token_mint.key());
 
         invoke(
             &init_mint_ix,
@@ -179,111 +184,77 @@ pub mod token_manager {
                 ctx.accounts.token_mint.to_account_info(),
                 ctx.accounts.rent.to_account_info(),
                 ctx.accounts.token_program.to_account_info(),
-                ctx.accounts.token_mint_authority.to_account_info(),
+                ctx.accounts.token_mint.to_account_info(),
             ],
         )?;
 
-        // 7. Initialize the metadata
-        // let token_metadata_bump = ctx.bumps.token_metadata;
-        // let token_mint_key = ctx.accounts.token_mint.key();
-        // let token_metadata_seeds = &[
-        //     b"token-metadata",
-        //     token_mint_key.as_ref(),
-        //     &[token_metadata_bump],
-        // ];
-        // let token_metadata_signer = &[&token_metadata_seeds[..]];
+        // Initialize TokenMetadata extension
+        msg!("Initializing TokenMetadata extension");
+        let token_metadata_ix = spl_token_metadata_interface::instruction::initialize(
+            &ctx.accounts.token_program.key(),
+            token_mint_key,
+            token_mint_key,
+            token_mint_key,
+            token_mint_key,
+            name.clone(),
+            symbol.clone(),
+            uri.clone(),
+        );
 
-        // msg!("Initializing token metadata");
-        // let token_mint_bump = ctx.bumps.token_mint_authority;
-        // let token_mint_key = ctx.accounts.token_mint.key();
-        // let token_mint_authority_seeds = &[
-        //     b"token-mint-authority",
-        //     token_mint_key.as_ref(),
-        //     &[token_mint_bump],
-        // ];
-        // let token_mint_authority_signer = &[&token_mint_authority_seeds[..]];
+        invoke_signed(
+            &token_metadata_ix,
+            &[
+                ctx.accounts.token_mint.to_account_info(),
+                ctx.accounts.token_mint.to_account_info(),
+                ctx.accounts.token_mint.to_account_info(),
+                ctx.accounts.token_mint.to_account_info(),
+            ],
+            token_mint_signer,
+        )?;
 
-        // let lamports = rent.minimum_balance(metadata_space);
-        // msg!("Creating token metadata account");
-        // msg!("Lamports: {}", lamports);
-        // msg!("Metadata space: {}", metadata_space);
+        // 7. Create and initialize the extra account meta list for transfer hooks
+        let account_metas = vec![ExtraAccountMeta::new_with_pubkey(
+            &ctx.accounts.token_manager.key(),
+            false, // is_signer
+            false, // is_writable
+        )?];
 
-        // invoke_signed(
-        //     &system_instruction::create_account(
-        //         &ctx.accounts.signer.key(),
-        //         &ctx.accounts.token_metadata.key(),
-        //         lamports,
-        //         metadata_space as u64,
-        //         &ctx.accounts.token_program.key(),
-        //     ),
-        //     &[
-        //         ctx.accounts.signer.to_account_info(),
-        //         ctx.accounts.token_metadata.to_account_info(),
-        //         ctx.accounts.system_program.to_account_info(),
-        //     ],
-        //     token_metadata_signer,
-        // )?;
+        // Calculate account size for meta list
+        let account_size = ExtraAccountMetaList::size_of(account_metas.len())?;
+        let meta_list_lamports = rent.minimum_balance(account_size);
 
+        // Create the account for the meta list
+        msg!("Creating extra account meta list account");
+        let meta_list_seeds = &[
+            b"extra-account-meta-list",
+            token_mint_key.as_ref(),
+            &[ctx.bumps.extra_account_meta_list],
+        ];
+        let meta_list_signer = &[&meta_list_seeds[..]];
+        invoke_signed(
+            &system_instruction::create_account(
+                &ctx.accounts.signer.key(),
+                &ctx.accounts.extra_account_meta_list.key(),
+                meta_list_lamports,
+                account_size as u64,
+                ctx.program_id,
+            ),
+            &[
+                ctx.accounts.signer.to_account_info(),
+                ctx.accounts.extra_account_meta_list.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+            meta_list_signer,
+        )?;
 
-        // let init_metadata_ix = spl_token_metadata_interface::instruction::initialize(
-        //     &ctx.accounts.token_program.key(),
-        //     &ctx.accounts.token_metadata.key(),
-        //     &ctx.accounts.token_mint_authority.key(),
-        //     &ctx.accounts.token_mint.key(),
-        //     &ctx.accounts.signer.key(),
-        //     name.clone(),
-        //     symbol.clone(),
-        //     uri.clone(),
-        // );
-
-        // invoke_signed(
-        //     &init_metadata_ix,
-        //     &[
-        //         ctx.accounts.token_program.to_account_info(),      // Program ID
-        //         ctx.accounts.token_metadata.to_account_info(),     // Metadata account
-        //         ctx.accounts.token_mint_authority.to_account_info(), // Update authority
-        //         ctx.accounts.token_mint.to_account_info(),         // Mint
-        //         ctx.accounts.signer.to_account_info(), // Mint authority
-        //     ],
-        //     token_mint_authority_signer,  // The token_mint_authority needs to sign
-        // )?;
-
-        // 8. Create and initialize the extra account meta list for transfer hooks
-        // let account_metas = vec![ExtraAccountMeta {
-        //     discriminator: 0,
-        //     address_config: ctx.accounts.token_manager.key().to_bytes(),
-        //     is_signer: PodBool::from(false),
-        //     is_writable: PodBool::from(false),
-        // }];
-
-        // // Calculate account size for meta list
-        // let account_size = ExtraAccountMetaList::size_of(account_metas.len())?;
-        // let meta_list_lamports = rent.minimum_balance(account_size);
-
-        // // Create the account for the meta list
-        // invoke_signed(
-        //     &system_instruction::create_account(
-        //         &ctx.accounts.signer.key(),
-        //         &ctx.accounts.extra_account_meta_list.key(),
-        //         meta_list_lamports,
-        //         account_size as u64,
-        //         &ctx.accounts.token_program.key(),
-        //     ),
-        //     &[
-        //         ctx.accounts.signer.to_account_info(),
-        //         ctx.accounts.extra_account_meta_list.to_account_info(),
-        //         ctx.accounts.system_program.to_account_info(),
-        //     ],
-        //     token_mint_signer,
-        // )?;
-
-        // // Initialize the meta list data
-        // let mut data = ctx.accounts.extra_account_meta_list.try_borrow_mut_data()?;
-        // ExtraAccountMetaList::init::<ExecuteInstruction>(&mut data, &account_metas)?;
+        // Initialize the meta list data
+        msg!("Initializing extra account meta list");
+        let mut data = ctx.accounts.extra_account_meta_list.try_borrow_mut_data()?;
+        ExtraAccountMetaList::init::<ExecuteInstruction>(&mut data, &account_metas)?;
 
         // 9. Store the token in the token manager
         ctx.accounts.token_manager.tokens.push(TokenShare {
-            mint: ctx.accounts.token_mint.key(),
+            mint: *token_mint_key,
             isin: isin,
             token_index: next_index,
         });
