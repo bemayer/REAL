@@ -17,8 +17,6 @@ use anchor_spl::{
 
 use spl_token_2022::extension::ExtensionType;
 
-use spl_pod::primitives::PodBool;
-
 use spl_tlv_account_resolution::{account::ExtraAccountMeta, state::ExtraAccountMetaList};
 
 use spl_transfer_hook_interface::instruction::ExecuteInstruction;
@@ -29,6 +27,27 @@ declare_id!("DFUYFchyBFtTjwGUKwdd6KsozCkT1Qkpx18KJAk5Esv5");
 pub mod token_manager {
     use super::*;
 
+    #[derive(Accounts)]
+    pub struct InitializeTokenManager<'info> {
+        /// The wallet signing the transaction and paying for account creation
+        #[account(mut)]
+        pub signer: Signer<'info>,
+
+        /// The main account that stores token information and whitelist
+        /// Created as a PDA derived from "token-manager" + signer
+        #[account(
+        init,
+        payer = signer,
+        space = TokenManager::INIT_SPACE,
+        seeds = [b"token-manager", signer.key().as_ref()],
+        bump,
+    )]
+        pub token_manager: Account<'info, TokenManager>,
+
+        /// Required for creating new accounts
+        pub system_program: Program<'info, System>,
+    }
+
     /// Initializes the TokenManager state account.
     /// This account will store all created token mints along with their ISIN codes.
     pub fn initialize_token_manager(ctx: Context<InitializeTokenManager>) -> Result<()> {
@@ -37,6 +56,47 @@ pub mod token_manager {
         ctx.accounts.token_manager.current_token_index = 0;
         ctx.accounts.token_manager.creator = ctx.accounts.signer.key();
         Ok(())
+    }
+
+    #[derive(Accounts)]
+    pub struct CreateNewShare<'info> {
+        /// The wallet signing and paying for the transaction
+        #[account(mut)]
+        pub signer: Signer<'info>,
+
+        /// Account storing token metadata and whitelist information
+        #[account(
+        mut,
+        seeds = [b"token-manager", signer.key().as_ref()],
+        bump,
+        )]
+        pub token_manager: Account<'info, TokenManager>,
+
+        /// The SPL token mint being created for this share
+        /// Uses token-mint + token_manager + index as seeds
+        #[account(
+        mut,
+        seeds = [b"token-mint", token_manager.key().as_ref(), &token_manager.current_token_index.to_le_bytes()],
+        bump,
+        )]
+        /// CHECK: This is initialized within the instruction
+        pub token_mint: AccountInfo<'info>,
+
+        /// Account storing metadata for SPL's transfer hook
+        /// Lists additional accounts to pass during transfers
+        /// CHECK: This account is verified in the CreateNewShare implementation
+        #[account(
+        mut,
+        seeds = [b"extra-account-meta-list", token_mint.key().as_ref()],
+        bump,
+        )]
+        pub extra_account_meta_list: AccountInfo<'info>,
+
+        /// Token program interface for SPL Token 2022
+        pub token_program: Program<'info, Token2022>,
+
+        /// Required for creating new accounts
+        pub system_program: Program<'info, System>,
     }
 
     /// Creates a new token share by deploying a new token mint with the specified number of decimals and ISIN code.
@@ -52,20 +112,10 @@ pub mod token_manager {
         decimals: u8,
         isin: String,
     ) -> Result<()> {
-        msg!("Creating new share with ISIN: {}", isin);
-
         // Validate ISIN format (should be 12 characters)
         if isin.len() != 12 {
             return Err(error!(TokenManagerError::InvalidIsinLength));
         }
-
-        // Validate that current_token_index won't overflow
-        let next_index = ctx
-            .accounts
-            .token_manager
-            .current_token_index
-            .checked_add(1)
-            .ok_or(error!(TokenManagerError::IndexOverflow))?;
 
         // 1. Calculate required space for mint with all extensions and metadata
         let name = format!("Security Token {}", isin);
@@ -99,11 +149,6 @@ pub mod token_manager {
 
         // 4. Create the mint account
         let token_mint_key = &ctx.accounts.token_mint.key();
-        msg!(
-            "Creating token mint account {} with {} bytes",
-            token_mint_key,
-            total_space,
-        );
 
         invoke_signed(
             &system_instruction::create_account(
@@ -121,16 +166,9 @@ pub mod token_manager {
             token_mint_signer,
         )?;
 
-        msg!("Checking mint account after creation:");
-        msg!("Owner: {}", ctx.accounts.token_mint.owner);
-        msg!("Lamports: {}", ctx.accounts.token_mint.lamports());
-        msg!("Data len: {}", ctx.accounts.token_mint.data_len());
-
         // 5. Initialize extensions first
-        msg!("Initializing extensions");
 
         // Initialize TransferHook extension
-        msg!("Initializing TransferHook extension");
         let transfer_hook_ix = spl_token_2022::extension::transfer_hook::instruction::initialize(
             &ctx.accounts.token_program.key(),
             token_mint_key,
@@ -142,12 +180,10 @@ pub mod token_manager {
             &transfer_hook_ix,
             &[
                 ctx.accounts.token_mint.to_account_info(),
-                ctx.accounts.token_mint.to_account_info(),
             ],
         )?;
 
         // Initialize MetadataPointer extension
-        msg!("Initializing MetadataPointer extension");
         let metadata_pointer_ix =
             spl_token_2022::extension::metadata_pointer::instruction::initialize(
                 &ctx.accounts.token_program.key(),
@@ -160,12 +196,10 @@ pub mod token_manager {
             &metadata_pointer_ix,
             &[
                 ctx.accounts.token_mint.to_account_info(),
-                ctx.accounts.token_mint.to_account_info(),
             ],
         )?;
 
         // 6. Now initialize the basic mint
-        msg!("Initializing mint {}", ctx.accounts.token_mint.key());
         let init_mint_ix = spl_token_2022::instruction::initialize_mint2(
             &ctx.accounts.token_program.key(),
             token_mint_key,
@@ -174,22 +208,14 @@ pub mod token_manager {
             decimals,
         )?;
 
-        msg!("Invoking SPL Token 2022 mint instruction");
-        msg!("Token manager: {}", token_manager);
-        msg!("Token mint authority: {}", ctx.accounts.token_mint.key());
-
         invoke(
             &init_mint_ix,
             &[
-                ctx.accounts.token_mint.to_account_info(),
-                ctx.accounts.rent.to_account_info(),
-                ctx.accounts.token_program.to_account_info(),
                 ctx.accounts.token_mint.to_account_info(),
             ],
         )?;
 
         // Initialize TokenMetadata extension
-        msg!("Initializing TokenMetadata extension");
         let token_metadata_ix = spl_token_metadata_interface::instruction::initialize(
             &ctx.accounts.token_program.key(),
             token_mint_key,
@@ -204,9 +230,6 @@ pub mod token_manager {
         invoke_signed(
             &token_metadata_ix,
             &[
-                ctx.accounts.token_mint.to_account_info(),
-                ctx.accounts.token_mint.to_account_info(),
-                ctx.accounts.token_mint.to_account_info(),
                 ctx.accounts.token_mint.to_account_info(),
             ],
             token_mint_signer,
@@ -224,7 +247,6 @@ pub mod token_manager {
         let meta_list_lamports = rent.minimum_balance(account_size);
 
         // Create the account for the meta list
-        msg!("Creating extra account meta list account");
         let meta_list_seeds = &[
             b"extra-account-meta-list",
             token_mint_key.as_ref(),
@@ -248,21 +270,37 @@ pub mod token_manager {
         )?;
 
         // Initialize the meta list data
-        msg!("Initializing extra account meta list");
         let mut data = ctx.accounts.extra_account_meta_list.try_borrow_mut_data()?;
         ExtraAccountMetaList::init::<ExecuteInstruction>(&mut data, &account_metas)?;
 
         // 9. Store the token in the token manager
+        let current_index = ctx.accounts.token_manager.current_token_index.clone();
         ctx.accounts.token_manager.tokens.push(TokenShare {
             mint: *token_mint_key,
             isin: isin,
-            token_index: next_index,
+            index: current_index,
         });
-
-        // Update the index for the next token
-        ctx.accounts.token_manager.current_token_index = next_index;
+        ctx.accounts.token_manager.current_token_index = current_index
+        .checked_add(1)
+        .ok_or(error!(TokenManagerError::IndexOverflow))?;
 
         Ok(())
+    }
+
+    #[derive(Accounts)]
+    pub struct Whitelist<'info> {
+        /// The wallet signing the transaction
+        #[account(mut)]
+        pub signer: Signer<'info>,
+
+        /// The account containing the whitelist to be modified
+        /// Only the creator should modify the whitelist
+        #[account(
+        mut,
+        seeds = [b"token-manager", signer.key().as_ref()],
+        bump,
+    )]
+        pub token_manager: Account<'info, TokenManager>,
     }
 
     /// Adds a wallet authorization to the whitelist for a token identified by its ISIN.
@@ -327,6 +365,50 @@ pub mod token_manager {
         Err(error!(TokenManagerError::TokenNotFound))
     }
 
+    #[derive(Accounts)]
+    pub struct TransferHook<'info> {
+        /// The token account sending tokens
+        /// Must have the specified mint and be owned by owner
+        #[account(
+        token::mint = mint,
+        token::authority = owner,
+    )]
+        pub source_token: InterfaceAccount<'info, TokenAccount>,
+
+        /// The mint of the token being transferred
+        pub mint: InterfaceAccount<'info, Mint>,
+
+        /// The token account receiving tokens
+        /// Must have the specified mint
+        #[account(
+        token::mint = mint,
+    )]
+        pub destination_token: InterfaceAccount<'info, TokenAccount>,
+
+        /// The authority (owner) of the source token account
+        /// The program verifies if this wallet is whitelisted
+        /// CHECK: This account is verified in the TransferHook implementation
+        pub owner: UncheckedAccount<'info>,
+
+        /// Account containing extra metadata for the transfer hook
+        /// Created by SPL Token 2022 program
+        /// CHECK: This account is verified in the TransferHook implementation
+        #[account(
+        mut,
+        seeds = [b"extra-account-meta-list", mint.key().as_ref()],
+        bump)
+    ]
+        pub extra_account_meta_list: AccountInfo<'info>,
+
+        /// Account storing the whitelist of authorized wallets
+        /// Used to validate if the owner can transfer tokens
+        #[account(
+        seeds = [b"token-manager", token_manager.creator.as_ref()],
+        bump,
+    )]
+        pub token_manager: Account<'info, TokenManager>,
+    }
+
     #[interface(spl_transfer_hook_interface::execute)]
     pub fn transfer_hook(ctx: Context<TransferHook>) -> Result<()> {
         let mint_key = ctx.accounts.mint.key();
@@ -346,57 +428,68 @@ pub mod token_manager {
         Err(error!(TokenManagerError::TransferNotAllowed))
     }
 
-    pub fn get_token(ctx: Context<GetToken>, isin: String) -> Result<Pubkey> {
-        if let Some(token) = ctx
-            .accounts
-            .token_manager
-            .tokens
-            .iter()
-            .find(|t| t.isin == isin)
-        {
-            return Ok(token.mint);
-        }
+    /// Structure for the mint_tokens instruction
+    #[derive(Accounts)]
+    #[instruction(token_index: u64)]
+    pub struct MintToken<'info> {
+        /// The wallet signing the transaction
+        #[account(mut)]
+        pub signer: Signer<'info>,
 
-        Err(error!(TokenManagerError::TokenNotFound))
+        /// Account storing token metadata and whitelist information
+        #[account(
+            mut,
+            seeds = [b"token-manager", signer.key().as_ref()],
+            bump,
+        )]
+        pub token_manager: Account<'info, TokenManager>,
+
+        /// The token mint - with seeds derived from token-manager + index
+        #[account(
+            mut,
+            seeds = [b"token-mint", token_manager.key().as_ref(), &token_index.to_le_bytes()],
+            bump,
+        )]
+        pub token_mint: InterfaceAccount<'info, Mint>,
+
+        /// The account receiving the tokens
+        #[account(mut)]
+        pub destination: InterfaceAccount<'info, TokenAccount>,
+
+        /// The Token 2022 program
+        pub token_program: Program<'info, Token2022>,
     }
 
-    pub fn mint_tokens(ctx: Context<MintToken>, amount: u64) -> Result<()> {
+    pub fn mint_tokens(ctx: Context<MintToken>, token_index: u64, amount: u64) -> Result<()> {
         // Verify the signer is the creator of the token manager
         if ctx.accounts.signer.key() != ctx.accounts.token_manager.creator {
             return Err(error!(TokenManagerError::Unauthorized));
         }
 
-        let token_mint_authority_bump = ctx.bumps.token_mint_authority;
-        let token_mint_authority_key = ctx.accounts.token_mint_authority.key();
-        let token_mint_authority_seeds = &[
-            b"token-mint-authority",
-            token_mint_authority_key.as_ref(),
-            &[token_mint_authority_bump],
+        let token_mint_bump = ctx.bumps.token_mint;
+        let token_manager_key = ctx.accounts.token_manager.key();
+        let token_mint_seeds = &[
+            b"token-mint",
+            token_manager_key.as_ref(),
+            &token_index.to_le_bytes(),
+            &[token_mint_bump],
         ];
-        let token_mint_authority_signer_seeds = &[&token_mint_authority_seeds[..]];
+        let token_mint_signer = &[&token_mint_seeds[..]];
 
-        // Mint tokens with the correct CPI context
         let cpi_accounts = MintTo {
             mint: ctx.accounts.token_mint.to_account_info(),
             to: ctx.accounts.destination.to_account_info(),
-            authority: ctx.accounts.token_mint_authority.to_account_info(),
+            authority: ctx.accounts.token_mint.to_account_info(),
         };
 
         mint_to(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
                 cpi_accounts,
-                token_mint_authority_signer_seeds,
+                token_mint_signer,
             ),
             amount,
         )?;
-
-        msg!(
-            "Minted {} tokens of PubKey {} to {}",
-            amount,
-            ctx.accounts.token_mint.key(),
-            ctx.accounts.destination.key()
-        );
 
         Ok(())
     }
@@ -424,205 +517,10 @@ fn calculate_metadata_space(name: &String, symbol: &String, uri: &String) -> usi
     header_size + name_size + symbol_size + uri_size + additional_fields_buffer
 }
 
-#[derive(Accounts)]
-pub struct InitializeTokenManager<'info> {
-    /// The wallet signing the transaction and paying for account creation
-    #[account(mut)]
-    pub signer: Signer<'info>,
-
-    /// The main account that stores token information and whitelist
-    /// Created as a PDA derived from "token-manager" + signer
-    #[account(
-        init,
-        payer = signer,
-        space = TokenManager::INIT_SPACE,
-        seeds = [b"token-manager", signer.key().as_ref()],
-        bump,
-    )]
-    pub token_manager: Account<'info, TokenManager>,
-
-    /// Required for creating new accounts
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct CreateNewShare<'info> {
-    /// The wallet signing and paying for the transaction
-    #[account(mut)]
-    pub signer: Signer<'info>,
-
-    /// Account storing token metadata and whitelist information
-    #[account(
-        mut,
-        seeds = [b"token-manager", signer.key().as_ref()],
-        bump,
-    )]
-    pub token_manager: Account<'info, TokenManager>,
-
-    /// The SPL token mint being created for this share
-    /// Uses token-mint + token_manager + index as seeds
-    #[account(
-        mut,
-        seeds = [b"token-mint", token_manager.key().as_ref(), &token_manager.current_token_index.to_le_bytes()],
-        bump,
-    )]
-    /// CHECK: This is initialized within the instruction
-    pub token_mint: AccountInfo<'info>,
-
-    /// PDA that serves as the mint authority for token_mint
-    /// Only this program can sign as this authority
-    #[account(
-        mut,
-        seeds = [b"token-mint-authority", token_mint.key().as_ref()],
-        bump,
-    )]
-    /// CHECK: This is a PDA that we use as a signer
-    pub token_mint_authority: UncheckedAccount<'info>,
-
-    /// Metadata account that will store token information
-    #[account(
-        mut,
-        seeds = [b"token-metadata", token_mint.key().as_ref()],
-        bump,
-    )]
-    /// CHECK: We initialize this in the instruction if needed
-    pub token_metadata: UncheckedAccount<'info>,
-
-    /// Account storing metadata for SPL's transfer hook
-    /// Lists additional accounts to pass during transfers
-    /// CHECK: This account is verified in the CreateNewShare implementation
-    #[account(
-        mut,
-        seeds = [b"extra-account-meta-list", token_mint.key().as_ref()],
-        bump)
-    ]
-    pub extra_account_meta_list: AccountInfo<'info>,
-
-    /// Token program interface for SPL Token 2022
-    pub token_program: Program<'info, Token2022>,
-
-    /// Required for creating new accounts
-    pub system_program: Program<'info, System>,
-
-    /// Required for rent calculations
-    pub rent: Sysvar<'info, Rent>,
-}
-
-#[derive(Accounts)]
-pub struct Whitelist<'info> {
-    /// The wallet signing the transaction
-    #[account(mut)]
-    pub signer: Signer<'info>,
-
-    /// The account containing the whitelist to be modified
-    /// Only the creator should modify the whitelist
-    #[account(
-        mut,
-        seeds = [b"token-manager", signer.key().as_ref()],
-        bump,
-    )]
-    pub token_manager: Account<'info, TokenManager>,
-}
-
-#[derive(Accounts)]
-pub struct TransferHook<'info> {
-    /// The token account sending tokens
-    /// Must have the specified mint and be owned by owner
-    #[account(
-        token::mint = mint,
-        token::authority = owner,
-    )]
-    pub source_token: InterfaceAccount<'info, TokenAccount>,
-
-    /// The mint of the token being transferred
-    pub mint: InterfaceAccount<'info, Mint>,
-
-    /// The token account receiving tokens
-    /// Must have the specified mint
-    #[account(
-        token::mint = mint,
-    )]
-    pub destination_token: InterfaceAccount<'info, TokenAccount>,
-
-    /// The authority (owner) of the source token account
-    /// The program verifies if this wallet is whitelisted
-    /// CHECK: This account is verified in the TransferHook implementation
-    pub owner: UncheckedAccount<'info>,
-
-    /// Account containing extra metadata for the transfer hook
-    /// Created by SPL Token 2022 program
-    /// CHECK: This account is verified in the TransferHook implementation
-    #[account(
-        mut,
-        seeds = [b"extra-account-meta-list", mint.key().as_ref()],
-        bump)
-    ]
-    pub extra_account_meta_list: AccountInfo<'info>,
-
-    /// Account storing the whitelist of authorized wallets
-    /// Used to validate if the owner can transfer tokens
-    #[account(
-        seeds = [b"token-manager", token_manager.creator.as_ref()],
-        bump,
-    )]
-    pub token_manager: Account<'info, TokenManager>,
-}
-
-/// Structure for querying a token mint by ISIN
-#[derive(Accounts)]
-pub struct GetToken<'info> {
-    /// The token manager containing the tokens information
-    #[account(
-        seeds = [b"token-manager", signer.key().as_ref()],
-        bump,
-    )]
-    pub token_manager: Account<'info, TokenManager>,
-
-    /// The wallet signing the transaction
-    pub signer: Signer<'info>,
-}
-
-/// Structure for the mint_tokens instruction
-#[derive(Accounts)]
-pub struct MintToken<'info> {
-    /// The wallet signing the transaction
-    #[account(mut)]
-    pub signer: Signer<'info>,
-
-    /// The token manager containing token information
-    #[account(
-        seeds = [b"token-manager", signer.key().as_ref()],
-        bump,
-        constraint = signer.key() == token_manager.creator @ TokenManagerError::Unauthorized,
-    )]
-    pub token_manager: Account<'info, TokenManager>,
-
-    /// The token mint
-    #[account(mut)]
-    pub token_mint: InterfaceAccount<'info, Mint>,
-
-    /// The PDA with authority to mint tokens
-    #[account(
-        seeds = [b"token-mint-authority", token_mint.key().as_ref()],
-        bump,
-    )]
-    pub token_mint_authority: SystemAccount<'info>,
-
-    /// The account receiving the tokens
-    #[account(
-        mut,
-        constraint = destination.mint == token_mint.key() @ TokenManagerError::InvalidTokenAccount
-    )]
-    pub destination: InterfaceAccount<'info, TokenAccount>,
-
-    /// The Token 2022 program
-    pub token_program: Program<'info, Token2022>,
-}
-
 #[account]
 #[derive(InitSpace)]
 pub struct TokenShare {
-    pub token_index: u64,
+    pub index: u64,
     #[max_len(12)]
     pub isin: String,
     pub mint: Pubkey,
