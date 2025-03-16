@@ -22,8 +22,6 @@ describe("Token Manager Program", () => {
     program.programId,
   );
 
-  console.log("Token manager PDA:", tokenManagerPDA.toString());
-
   const tokensToCreate = [
     { decimals: 6, isin: "US1234567890" },
     { decimals: 8, isin: "US9876543210" },
@@ -108,7 +106,6 @@ describe("Token Manager Program", () => {
     it("should initialize the TokenManager account", async () => {
       try {
         await program.account.tokenManager.fetch(tokenManagerPDA);
-        console.log("TokenManager already initialized, skipping initialization");
       } catch (error) {
         const txSig = await program.methods
           .initializeTokenManager()
@@ -133,14 +130,10 @@ describe("Token Manager Program", () => {
         let tokenManagerAccount = await program.account.tokenManager.fetch(tokenManagerPDA);
         const index = tokenManagerAccount.currentTokenIndex.toNumber();
 
-        console.log("Index:", index);
-
         const [tokenMintPDA] = PublicKey.findProgramAddressSync(
           [Buffer.from("token-mint"), tokenManagerPDA.toBuffer(), Buffer.from(new BigUint64Array([BigInt(index)]).buffer)],
           program.programId,
         );
-
-        console.log("Token mint PDA:", tokenMintPDA.toString());
 
         try {
           const txSig = await program.methods
@@ -172,7 +165,6 @@ describe("Token Manager Program", () => {
           expect(tokenManagerAccount.tokens[lastIndex].mint.toString()).to.equal(tokenMintPDA.toString());
           expect(tokenManagerAccount.tokens[lastIndex].isin).to.equal(tokenData.isin);
         } catch (error) {
-          console.log(error);
           if (error.message?.includes("already in use")) {
             console.log(`Token ${tokenData.isin} already exists, skipping creation`);
 
@@ -233,7 +225,6 @@ describe("Token Manager Program", () => {
         );
 
         if (existingAuth) {
-          console.log(`Wallet already authorized for ${tokenData.isin}, skipping`);
           continue;
         }
 
