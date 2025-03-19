@@ -415,10 +415,6 @@ pub mod token_manager {
         let mint_key = ctx.accounts.mint.key();
         let destination_owner = ctx.accounts.destination_token.owner;
 
-        msg!("Transfer hook called");
-        msg!("Mint key: {}", mint_key);
-        msg!("Destination owner: {}", destination_owner);
-
         if let Some(_) = &ctx
             .accounts
             .token_manager
