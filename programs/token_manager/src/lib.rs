@@ -87,7 +87,7 @@ pub mod token_manager {
         /// CHECK: This account is verified in the CreateNewShare implementation
         #[account(
         mut,
-        seeds = [b"extra-account-meta-list", token_mint.key().as_ref()],
+        seeds = [b"extra-account-metas", token_mint.key().as_ref()],
         bump,
         )]
         pub extra_account_meta_list: AccountInfo<'info>,
@@ -172,14 +172,16 @@ pub mod token_manager {
         let transfer_hook_ix = spl_token_2022::extension::transfer_hook::instruction::initialize(
             &ctx.accounts.token_program.key(),
             token_mint_key,
-            Some(*token_mint_key),
-            Some(*token_mint_key),
+            Some(ctx.accounts.token_manager.key()),
+            Some(*ctx.program_id),
         )?;
 
         invoke(
             &transfer_hook_ix,
             &[
                 ctx.accounts.token_mint.to_account_info(),
+                ctx.accounts.extra_account_meta_list.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
             ],
         )?;
 
@@ -248,7 +250,7 @@ pub mod token_manager {
 
         // Create the account for the meta list
         let meta_list_seeds = &[
-            b"extra-account-meta-list",
+            b"extra-account-metas",
             token_mint_key.as_ref(),
             &[ctx.bumps.extra_account_meta_list],
         ];
@@ -324,7 +326,7 @@ pub mod token_manager {
         {
             let authorization = Authorization {
                 mint: token.mint,
-                authority: wallet,
+                wallet: wallet,
             };
             ctx.accounts.token_manager.whitelist.push(authorization);
             return Ok(());
@@ -355,7 +357,7 @@ pub mod token_manager {
                 .token_manager
                 .whitelist
                 .iter()
-                .position(|auth| auth.mint == token.mint && auth.authority == wallet)
+                .position(|auth| auth.mint == token.mint && auth.wallet == wallet)
             {
                 ctx.accounts.token_manager.whitelist.remove(*index);
                 return Ok(());
@@ -394,8 +396,7 @@ pub mod token_manager {
         /// Created by SPL Token 2022 program
         /// CHECK: This account is verified in the TransferHook implementation
         #[account(
-        mut,
-        seeds = [b"extra-account-meta-list", mint.key().as_ref()],
+        seeds = [b"extra-account-metas", mint.key().as_ref()],
         bump)
     ]
         pub extra_account_meta_list: AccountInfo<'info>,
@@ -412,15 +413,18 @@ pub mod token_manager {
     #[interface(spl_transfer_hook_interface::execute)]
     pub fn transfer_hook(ctx: Context<TransferHook>) -> Result<()> {
         let mint_key = ctx.accounts.mint.key();
-        let owner_key = ctx.accounts.owner.key();
+        let destination_owner = ctx.accounts.destination_token.owner;
 
-        // Check if the wallet is whitelisted
+        msg!("Transfer hook called");
+        msg!("Mint key: {}", mint_key);
+        msg!("Destination owner: {}", destination_owner);
+
         if let Some(_) = &ctx
             .accounts
             .token_manager
             .whitelist
             .iter()
-            .find(|auth| auth.mint == mint_key && auth.authority == owner_key)
+            .find(|auth| auth.mint == mint_key && auth.wallet == destination_owner)
         {
             return Ok(());
         }
@@ -530,7 +534,7 @@ pub struct TokenShare {
 #[derive(InitSpace)]
 pub struct Authorization {
     pub mint: Pubkey,
-    pub authority: Pubkey,
+    pub wallet: Pubkey,
 }
 
 #[account]

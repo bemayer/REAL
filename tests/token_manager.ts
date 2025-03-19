@@ -6,9 +6,10 @@ import {
   TOKEN_2022_PROGRAM_ID,
   getMint,
   getAccount,
-  createTransferCheckedInstruction,
   getAssociatedTokenAddress,
-  createAssociatedTokenAccountInstruction
+  createAssociatedTokenAccountInstruction,
+  createTransferCheckedWithTransferHookInstruction,
+  createAssociatedTokenAccountIdempotent
 } from "@solana/spl-token";
 import { expect } from "chai";
 
@@ -31,7 +32,7 @@ describe("Token Manager Program", () => {
   const wallets = {
     authorized: web3.Keypair.generate(),
     unauthorized: web3.Keypair.generate(),
-    destination: web3.Keypair.generate()
+    destination: web3.Keypair.generate(),
   };
 
   const tokenMints = [];
@@ -40,7 +41,7 @@ describe("Token Manager Program", () => {
     await provider.connection.confirmTransaction({
       signature,
       blockhash: (await provider.connection.getLatestBlockhash('confirmed')).blockhash,
-      lastValidBlockHeight: (await provider.connection.getLatestBlockhash('confirmed')).lastValidBlockHeight
+      lastValidBlockHeight: (await provider.connection.getLatestBlockhash('confirmed')).lastValidBlockHeight,
     }, "confirmed");
   }
 
@@ -65,7 +66,7 @@ describe("Token Manager Program", () => {
         provider.connection,
         tokenAccount,
         "confirmed",
-        TOKEN_2022_PROGRAM_ID
+        TOKEN_2022_PROGRAM_ID,
       );
       return tokenAccount;
     } catch (error) {
@@ -85,7 +86,7 @@ describe("Token Manager Program", () => {
     }
   }
 
-  async function getTokenForIsin(isin: string): Promise<{mint: PublicKey, index: anchor.BN}> {
+  async function getTokenForIsin(isin: string): Promise<{ mint: PublicKey, index: anchor.BN }> {
     const tokenManagerAccount = await program.account.tokenManager.fetch(tokenManagerPDA);
     const token = tokenManagerAccount.tokens.find(t => t.isin === isin);
 
@@ -154,7 +155,7 @@ describe("Token Manager Program", () => {
             provider.connection,
             tokenMintPDA,
             "confirmed",
-            TOKEN_2022_PROGRAM_ID
+            TOKEN_2022_PROGRAM_ID,
           );
 
           expect(mintInfo.decimals).to.equal(tokenData.decimals);
@@ -200,7 +201,7 @@ describe("Token Manager Program", () => {
 
       try {
         await program.methods
-          .addToWhitelist(wallets.authorized.publicKey, nonExistentIsin)
+          .addToWhitelist(wallets.destination.publicKey, nonExistentIsin)
           .accounts({
             signer: provider.wallet.publicKey,
           })
@@ -219,8 +220,8 @@ describe("Token Manager Program", () => {
           auth => {
             const token = tokenManagerAccount.tokens.find(t => t.isin === tokenData.isin);
             return token &&
-                   auth.mint.toString() === token.mint.toString() &&
-                   auth.authority.toString() === wallets.authorized.publicKey.toString();
+              auth.mint.toString() === token.mint.toString() &&
+              auth.wallet.toString() === wallets.destination.publicKey.toString();
           }
         );
 
@@ -229,7 +230,7 @@ describe("Token Manager Program", () => {
         }
 
         const txSig = await program.methods
-          .addToWhitelist(wallets.authorized.publicKey, tokenData.isin)
+          .addToWhitelist(wallets.destination.publicKey, tokenData.isin)
           .accounts({
             signer: provider.wallet.publicKey,
           })
@@ -246,7 +247,7 @@ describe("Token Manager Program", () => {
 
         const authorization = tokenManagerAccount.whitelist.find(
           auth => auth.mint.toString() === token.mint.toString() &&
-                 auth.authority.toString() === wallets.authorized.publicKey.toString()
+            auth.wallet.toString() === wallets.destination.publicKey.toString()
         );
 
         expect(authorization).to.not.be.undefined;
@@ -298,211 +299,216 @@ describe("Token Manager Program", () => {
         provider.connection,
         tokenAccount,
         "confirmed",
-        TOKEN_2022_PROGRAM_ID
+        TOKEN_2022_PROGRAM_ID,
       )).amount;
 
       expect(authBalance.toString()).to.equal(mintAmount.toString());
     });
   });
 
-//   describe("5. Transfer Tests", () => {
-//     let testMint;
-//     let authorizedTokenAccount;
-//     let unauthorizedTokenAccount;
-//     let destinationTokenAccount;
+  describe("5. Transfer Tests", () => {
+    let testMint;
+    let authorizedTokenAccount;
+    let unauthorizedTokenAccount;
+    let destinationTokenAccount;
 
-//     before(async () => {
-//       testMint = tokenMints[0];
+    before(async () => {
+      testMint = tokenMints[0];
 
-//       authorizedTokenAccount = await createTokenAccount(wallets.authorized, testMint);
-//       unauthorizedTokenAccount = await createTokenAccount(wallets.unauthorized, testMint);
-//       destinationTokenAccount = await createTokenAccount(wallets.destination, testMint);
-//     });
+      authorizedTokenAccount = await createTokenAccount(wallets.authorized, testMint);
+      unauthorizedTokenAccount = await createTokenAccount(wallets.unauthorized, testMint);
+      destinationTokenAccount = await createTokenAccount(wallets.destination, testMint);
+      await new Promise(resolve => setTimeout(resolve, 400));
+    });
 
-//     it("should allow a transfer from a whitelisted wallet", async () => {
-//       const preBalanceAuth = (await getAccount(
-//         provider.connection,
-//         authorizedTokenAccount,
-//         "confirmed",
-//         TOKEN_2022_PROGRAM_ID
-//       )).amount;
+    it("should allow a transfer from a whitelisted wallet", async () => {
+      const preBalanceAuth = (await getAccount(
+        provider.connection,
+        authorizedTokenAccount,
+        "confirmed",
+        TOKEN_2022_PROGRAM_ID,
+      )).amount;
 
-//       const preBalanceDest = (await getAccount(
-//         provider.connection,
-//         destinationTokenAccount,
-//         "confirmed",
-//         TOKEN_2022_PROGRAM_ID
-//       )).amount;
+      const preBalanceDest = (await getAccount(
+        provider.connection,
+        destinationTokenAccount,
+        "confirmed",
+        TOKEN_2022_PROGRAM_ID,
+      )).amount;
 
-//       const transferAmount = BigInt(100000);
+      const transferAmount = BigInt(200000);
 
-//       const mintInfo = await getMint(
-//         provider.connection,
-//         testMint,
-//         "confirmed",
-//         TOKEN_2022_PROGRAM_ID
-//       );
+      const mintInfo = await getMint(
+        provider.connection,
+        testMint,
+        "confirmed",
+        TOKEN_2022_PROGRAM_ID,
+      );
 
-//       const transferIx = createTransferCheckedInstruction(
-//         authorizedTokenAccount,
-//         testMint,
-//         destinationTokenAccount,
-//         wallets.authorized.publicKey,
-//         transferAmount,
-//         mintInfo.decimals,
-//         [],
-//         TOKEN_2022_PROGRAM_ID
-//       );
+      const transferIx = await createTransferCheckedWithTransferHookInstruction(
+        provider.connection,
+        authorizedTokenAccount,
+        testMint,
+        destinationTokenAccount,
+        wallets.authorized.publicKey,
+        transferAmount,
+        mintInfo.decimals,
+        [],
+        "confirmed",
+        TOKEN_2022_PROGRAM_ID,
+      );
 
-//       const tx = new web3.Transaction().add(transferIx);
+      const tx = new web3.Transaction().add(transferIx);
 
-//       await web3.sendAndConfirmTransaction(
-//         provider.connection,
-//         tx,
-//         [wallets.authorized],
-//         { commitment: "confirmed" }
-//       );
+      await web3.sendAndConfirmTransaction(
+        provider.connection,
+        tx,
+        [wallets.authorized],
+        { commitment: "confirmed" }
+      );
 
-//       const postBalanceAuth = (await getAccount(
-//         provider.connection,
-//         authorizedTokenAccount,
-//         "confirmed",
-//         TOKEN_2022_PROGRAM_ID
-//       )).amount;
+      const postBalanceAuth = (await getAccount(
+        provider.connection,
+        authorizedTokenAccount,
+        "confirmed",
+        TOKEN_2022_PROGRAM_ID,
+      )).amount;
 
-//       const postBalanceDest = (await getAccount(
-//         provider.connection,
-//         destinationTokenAccount,
-//         "confirmed",
-//         TOKEN_2022_PROGRAM_ID
-//       )).amount;
+      const postBalanceDest = (await getAccount(
+        provider.connection,
+        destinationTokenAccount,
+        "confirmed",
+        TOKEN_2022_PROGRAM_ID,
+      )).amount;
 
-//       expect(postBalanceAuth.toString()).to.equal((preBalanceAuth - transferAmount).toString());
-//       expect(postBalanceDest.toString()).to.equal((preBalanceDest + transferAmount).toString());
-//     });
+      expect(postBalanceAuth.toString()).to.equal((preBalanceAuth - transferAmount).toString());
+      expect(postBalanceDest.toString()).to.equal((preBalanceDest + transferAmount).toString());
+    });
 
-//     it("should block a transfer from a non-whitelisted wallet", async () => {
-//       const preBalanceUnauth = (await getAccount(
-//         provider.connection,
-//         unauthorizedTokenAccount,
-//         "confirmed",
-//         TOKEN_2022_PROGRAM_ID
-//       )).amount;
+    it("should block a transfer from a non-whitelisted wallet", async () => {
+      const preBalanceUnauth = (await getAccount(
+        provider.connection,
+        unauthorizedTokenAccount,
+        "confirmed",
+        TOKEN_2022_PROGRAM_ID,
+      )).amount;
 
-//       const preBalanceDest = (await getAccount(
-//         provider.connection,
-//         destinationTokenAccount,
-//         "confirmed",
-//         TOKEN_2022_PROGRAM_ID
-//       )).amount;
+      const preBalanceDest = (await getAccount(
+        provider.connection,
+        destinationTokenAccount,
+        "confirmed",
+        TOKEN_2022_PROGRAM_ID,
+      )).amount;
 
-//       const transferAmount = BigInt(100000);
+      const transferAmount = BigInt(100000);
 
-//       const mintInfo = await getMint(
-//         provider.connection,
-//         testMint,
-//         "confirmed",
-//         TOKEN_2022_PROGRAM_ID
-//       );
+      const mintInfo = await getMint(
+        provider.connection,
+        testMint,
+        "confirmed",
+        TOKEN_2022_PROGRAM_ID,
+      );
 
-//       const transferIx = createTransferCheckedInstruction(
-//         unauthorizedTokenAccount,
-//         testMint,
-//         destinationTokenAccount,
-//         wallets.unauthorized.publicKey,
-//         transferAmount,
-//         mintInfo.decimals,
-//         [],
-//         TOKEN_2022_PROGRAM_ID
-//       );
+      const transferIx = await createTransferCheckedWithTransferHookInstruction(
+        provider.connection,
+        authorizedTokenAccount,
+        testMint,
+        unauthorizedTokenAccount,
+        wallets.authorized.publicKey,
+        transferAmount,
+        mintInfo.decimals,
+        [],
+        "confirmed",
+        TOKEN_2022_PROGRAM_ID,
+      );
 
-//       const tx = new web3.Transaction().add(transferIx);
+      const tx = new web3.Transaction().add(transferIx);
 
-//       try {
-//         await web3.sendAndConfirmTransaction(
-//           provider.connection,
-//           tx,
-//           [wallets.unauthorized],
-//           { commitment: "confirmed" }
-//         );
-//         expect.fail("Expected transaction to fail but it succeeded");
-//       } catch (error) {
-//         expect(error.logs.some(log => log.includes("TransferNotAllowed"))).to.be.true;
-//       }
+      try {
+        await web3.sendAndConfirmTransaction(
+          provider.connection,
+          tx,
+          [wallets.authorized],
+          { commitment: "confirmed" }
+        );
+        expect.fail("Expected transaction to fail but it succeeded");
+      } catch (error) {
+        expect(error.logs.some(log => log.includes("Transfer not allowed"))).to.be.true;
+      }
 
-//       const postBalanceUnauth = (await getAccount(
-//         provider.connection,
-//         unauthorizedTokenAccount,
-//         "confirmed",
-//         TOKEN_2022_PROGRAM_ID
-//       )).amount;
+      const postBalanceUnauth = (await getAccount(
+        provider.connection,
+        unauthorizedTokenAccount,
+        "confirmed",
+        TOKEN_2022_PROGRAM_ID,
+      )).amount;
 
-//       const postBalanceDest = (await getAccount(
-//         provider.connection,
-//         destinationTokenAccount,
-//         "confirmed",
-//         TOKEN_2022_PROGRAM_ID
-//       )).amount;
+      const postBalanceDest = (await getAccount(
+        provider.connection,
+        destinationTokenAccount,
+        "confirmed",
+        TOKEN_2022_PROGRAM_ID,
+      )).amount;
 
-//       expect(postBalanceUnauth.toString()).to.equal(preBalanceUnauth.toString());
-//       expect(postBalanceDest.toString()).to.equal(preBalanceDest.toString());
-//     });
-//   });
+      expect(postBalanceUnauth.toString()).to.equal(preBalanceUnauth.toString());
+      expect(postBalanceDest.toString()).to.equal(preBalanceDest.toString());
+    });
+  });
 
-//   describe("6. Additional Token Queries", () => {
-//     it("should correctly retrieve token mint by ISIN", async () => {
-//       const testIsin = tokensToCreate[0].isin;
+  //   describe("6. Additional Token Queries", () => {
+  //     it("should correctly retrieve token mint by ISIN", async () => {
+  //       const testIsin = tokensToCreate[0].isin;
 
-//       const tokenManagerAccount = await program.account.tokenManager.fetch(tokenManagerPDA);
-//       const expectedMint = tokenManagerAccount.tokens.find(t => t.isin === testIsin).mint;
+  //       const tokenManagerAccount = await program.account.tokenManager.fetch(tokenManagerPDA);
+  //       const expectedMint = tokenManagerAccount.tokens.find(t => t.isin === testIsin).mint;
 
-//       const fetchedMint = await program.methods
-//         .getToken(testIsin)
-//         .accounts({
-//           signer: provider.wallet.publicKey
-//         })
-//         .view();
+  //       const fetchedMint = await program.methods
+  //         .getToken(testIsin)
+  //         .accounts({
+  //           signer: provider.wallet.publicKey
+  //         })
+  //         .view();
 
-//       expect(fetchedMint.toString()).to.equal(expectedMint.toString());
-//     });
+  //       expect(fetchedMint.toString()).to.equal(expectedMint.toString());
+  //     });
 
-//     it("should fail to retrieve a non-existent token", async () => {
-//       const nonExistentIsin = "DOES_NOT_EXIST";
+  //     it("should fail to retrieve a non-existent token", async () => {
+  //       const nonExistentIsin = "DOES_NOT_EXIST";
 
-//       try {
-//         await program.methods
-//           .getToken(nonExistentIsin)
-//           .accounts({
-//             signer: provider.wallet.publicKey,
-//           })
-//           .view();
-//         expect.fail("Expected error when retrieving a non-existent token");
-//       } catch (err: any) {
-//         expect(err.error.errorCode.code).to.equal("TokenNotFound");
-//       }
-//     });
-//   });
+  //       try {
+  //         await program.methods
+  //           .getToken(nonExistentIsin)
+  //           .accounts({
+  //             signer: provider.wallet.publicKey,
+  //           })
+  //           .view();
+  //         expect.fail("Expected error when retrieving a non-existent token");
+  //       } catch (err: any) {
+  //         expect(err.error.errorCode.code).to.equal("TokenNotFound");
+  //       }
+  //     });
+  //   });
 
-//   describe("7. Whitelist Management Edge Cases", () => {
-//     it("should not allow duplicates in the whitelist", async () => {
-//       const validIsin = tokensToCreate[0].isin;
+  //   describe("7. Whitelist Management Edge Cases", () => {
+  //     it("should not allow duplicates in the whitelist", async () => {
+  //       const validIsin = tokensToCreate[0].isin;
 
-//       await program.methods
-//         .addToWhitelist(wallets.authorized.publicKey, validIsin)
-//         .accounts({
-//           signer: provider.wallet.publicKey,
-//         })
-//         .rpc();
+  //       await program.methods
+  //         .addToWhitelist(wallets.authorized.publicKey, validIsin)
+  //         .accounts({
+  //           signer: provider.wallet.publicKey,
+  //         })
+  //         .rpc();
 
-//       const updatedTokenManagerAccount = await program.account.tokenManager.fetch(tokenManagerPDA);
+  //       const updatedTokenManagerAccount = await program.account.tokenManager.fetch(tokenManagerPDA);
 
-//       const token = updatedTokenManagerAccount.tokens.find(t => t.isin === validIsin);
-//       const relevantEntries = updatedTokenManagerAccount.whitelist.filter(
-//         auth => auth.mint.toString() === token.mint.toString() &&
-//                auth.authority.toString() === wallets.authorized.publicKey.toString()
-//       );
+  //       const token = updatedTokenManagerAccount.tokens.find(t => t.isin === validIsin);
+  //       const relevantEntries = updatedTokenManagerAccount.whitelist.filter(
+  //         auth => auth.mint.toString() === token.mint.toString() &&
+  //                auth.authority.toString() === wallets.authorized.publicKey.toString()
+  //       );
 
-//       expect(relevantEntries.length).to.equal(1);
-//     });
-//   });
+  //       expect(relevantEntries.length).to.equal(1);
+  //     });
+  //   });
 });
