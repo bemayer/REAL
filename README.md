@@ -1,7 +1,5 @@
 # TokenManager - Asset Tokenization on Solana
 
-> A lightweight Solana program for tokenizing assets with ISIN identifiers and transfer restrictions using SPL Token-2022's transfer hooks.
-
 TokenManager is a tokenization project built on Solana that helps with digitizing financial assets. It uses SPL Token 2022 features to implement basic transfer rules and whitelist functionality.
 
 ## Features
